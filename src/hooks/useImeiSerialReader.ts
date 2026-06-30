@@ -3,7 +3,6 @@ import {
   Camera,
   type CameraDevice,
   type CameraDeviceFormat,
-  runAsync,
   runAtTargetFps,
   useCameraDevice,
   useCameraFormat,
@@ -165,29 +164,30 @@ export function useImeiSerialReader(opts: UseImeiSerialReaderOptions): UseImeiSe
         if (isBusy.value) return;
         if (Date.now() < graceUntil.value) return;
 
-        // Both modes use runAsync — preview stays smooth while scanText runs
-        // on a separate worklet runtime. nativeFrameToJpeg returns only
-        // primitives (string + numbers), so it's safe to call inside runAsync
-        // unlike the resize plugin (ArrayBuffer runtime affinity).
-        runAsync(frame, () => {
-          'worklet';
-          try {
-            const raw = scanText(frame);
-            const rt = toRecognizedText(raw);
-            const values = parser(rt);
-            if (values != null && values.length > 0) {
-              isBusy.value = true;
-              if (CAPTURE_MODE === 'native-frame' && captureFrameFlag.value) {
-                const ext = nativeFrameToJpeg(frame, JPEG_QUALITY);
-                handleMatchJs(values, ext.path, ext.width, ext.height, ext.orientation);
-              } else {
-                handleMatchJs(values, null, 0, 0, null);
-              }
+        // Run scanText synchronously on the camera frame thread. The
+        // original code used `runAsync(frame, ...)` to push OCR onto a
+        // second worklet runtime, but under React Native's new architecture
+        // (bridgeless mode) that secondary runtime crashes with SIGSEGV in
+        // `JsiWorkletContext::invokeOnWorkletThread` on Android — confirmed
+        // tombstone with backtrace going through librnworklets.so →
+        // libVisionCamera.so → CameraView.onFrame. We're already throttled
+        // to TARGET_FPS via runAtTargetFps, so synchronous OCR is fine.
+        try {
+          const raw = scanText(frame);
+          const rt = toRecognizedText(raw);
+          const values = parser(rt);
+          if (values != null && values.length > 0) {
+            isBusy.value = true;
+            if (CAPTURE_MODE === 'native-frame' && captureFrameFlag.value) {
+              const ext = nativeFrameToJpeg(frame, JPEG_QUALITY);
+              handleMatchJs(values, ext.path, ext.width, ext.height, ext.orientation);
+            } else {
+              handleMatchJs(values, null, 0, 0, null);
             }
-          } catch (e) {
-            reportErrorJs(e as Error);
           }
-        });
+        } catch (e) {
+          reportErrorJs(e as Error);
+        }
       });
     },
     [parser, scanText, handleMatchJs, reportErrorJs, isBusy, graceUntil, captureFrameFlag],
