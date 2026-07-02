@@ -1,6 +1,6 @@
 {
   "name": "react-native-imei-serial-reader",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Live-camera OCR scanner for IMEI / Serial Number / Flexible Barcode / Exact-Match readers. RN port of the Flutter imei_serial_reader package.",
   "react-native": "src/index.ts",
   "source": "src/index.ts",
