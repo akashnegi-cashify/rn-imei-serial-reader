@@ -10,8 +10,7 @@ import {
   useFrameProcessor,
 } from 'react-native-vision-camera';
 import { Worklets, useSharedValue } from 'react-native-worklets-core';
-import { useTextRecognition } from 'react-native-vision-camera-text-recognition';
-import { CAPTURE_MODE } from '../captureMode';
+import { PhotoRecognizer } from 'react-native-vision-camera-text-recognition';
 import { createParser } from '../parsers';
 import { toRecognizedText } from '../adapters/mlkitAdapter';
 import { nativeFrameToJpeg } from '../adapters/nativeFrameToJpeg';
@@ -19,7 +18,6 @@ import type { Frame, FrameOrientation, ParserConfig } from '../types';
 
 const GRACE_MS = 1000;
 const TARGET_FPS = 10;
-const TEXT_RECOGNITION_OPTIONS = { language: 'latin' } as const;
 const JPEG_QUALITY = 80;
 
 export interface UseImeiSerialReaderOptions {
@@ -47,9 +45,8 @@ export function useImeiSerialReader(opts: UseImeiSerialReaderOptions): UseImeiSe
   const [error, setError] = useState<Error | null>(null);
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice('back');
-  // Cap photo resolution. Only relevant when CAPTURE_MODE === 'take-photo'
-  // (default formats are 12+MP which makes takePhoto encode slowly). Harmless
-  // in 'native-frame' mode where takePhoto isn't called.
+  // Cap video/photo resolution. 1280x720 keeps the frames light enough for
+  // fast YUV→JPEG conversion and ML Kit text recognition.
   const format = useCameraFormat(device, [
     { photoResolution: { width: 1920, height: 1080 } },
     { videoResolution: { width: 1280, height: 720 } },
@@ -57,21 +54,18 @@ export function useImeiSerialReader(opts: UseImeiSerialReaderOptions): UseImeiSe
 
   const isBusy = useSharedValue<boolean>(false);
   const graceUntil = useSharedValue<number>(0);
+  // True while a JS-thread PhotoRecognizer call is in flight. Prevents the
+  // frame processor from queueing up multiple OCR requests — one attempt
+  // completes before the next frame is even considered.
+  const isProcessing = useSharedValue<boolean>(false);
 
   const onDoneRef = useRef(opts.onDone);
   onDoneRef.current = opts.onDone;
   const onErrorRef = useRef(opts.onError);
   onErrorRef.current = opts.onError;
-  // Used by the takePhoto path (decision made on JS thread).
+  // OCR runs on the JS thread now, so this ref is read from `recognizeAndMatch`.
   const captureFrameRef = useRef(!!opts.captureFrame);
   captureFrameRef.current = !!opts.captureFrame;
-
-  // Used by the native-frame path (decision made inside the worklet, since
-  // nativeFrameToJpeg has to run while the Frame is alive).
-  const captureFrameFlag = useSharedValue<boolean>(!!opts.captureFrame);
-  useEffect(() => {
-    captureFrameFlag.value = !!opts.captureFrame;
-  }, [opts.captureFrame, captureFrameFlag]);
 
   const parserResult = useMemo<{ parser: ReturnType<typeof createParser> | null; error: Error | null }>(() => {
     try {
@@ -103,57 +97,45 @@ export function useImeiSerialReader(opts: UseImeiSerialReaderOptions): UseImeiSe
     }
   }, [isActive, isBusy, graceUntil]);
 
-  const handleMatch = useCallback(
-    async (
-      values: string[],
-      path: string | null,
-      width: number,
-      height: number,
-      orientation: FrameOrientation | null,
-    ) => {
+  const reportError = useCallback((e: Error) => {
+    setError(e);
+    onErrorRef.current?.(e);
+  }, []);
+  const reportErrorJs = useMemo(() => Worklets.createRunOnJS(reportError), [reportError]);
+
+  // JS-thread OCR + match handler. Called via `runOnJS` from the frame
+  // processor with a JPEG file path (already written on the frame thread).
+  // PhotoRecognizer is a plain NativeModule call — no worklets involved —
+  // so it avoids the SIGSEGV in worklets-core's `invokeOnWorkletThread`
+  // that killed the old `runAsync(frame, ...)` path under bridgeless mode.
+  const recognizeAndMatch = useCallback(
+    async (path: string, width: number, height: number, orientation: FrameOrientation) => {
       try {
-        let frame: Frame | undefined;
-        if (CAPTURE_MODE === 'native-frame') {
-          // Worklet already wrote the JPEG and gave us its path. No async work.
-          if (path != null && orientation != null) {
-            frame = { uri: `file://${path}`, width, height, orientation };
-          }
-        } else {
-          // CAPTURE_MODE === 'take-photo'
-          if (captureFrameRef.current && cameraRef.current != null) {
-            const photo = await cameraRef.current.takePhoto({
-              enableShutterSound: false,
-              flash: 'off',
-            });
-            frame = {
-              uri: `file://${photo.path}`,
-              width: photo.width,
-              height: photo.height,
-              orientation: photo.orientation as FrameOrientation,
-            };
-          }
+        if (parser == null) return;
+        const raw = await PhotoRecognizer({ uri: `file://${path}`, orientation });
+        const rt = toRecognizedText(raw);
+        const values = parser(rt);
+        if (values != null && values.length > 0) {
+          isBusy.value = true;
+          const frameForConsumer: Frame | undefined = captureFrameRef.current
+            ? { uri: `file://${path}`, width, height, orientation }
+            : undefined;
+          onDoneRef.current(values, frameForConsumer);
         }
-        onDoneRef.current(values, frame);
       } catch (e) {
         const err = e as Error;
         setError(err);
         onErrorRef.current?.(err);
       } finally {
-        isBusy.value = false;
+        isProcessing.value = false;
       }
     },
-    [isBusy],
+    [parser, isBusy, isProcessing],
   );
-
-  const reportError = useCallback((e: Error) => {
-    setError(e);
-    onErrorRef.current?.(e);
-  }, []);
-
-  const handleMatchJs = useMemo(() => Worklets.createRunOnJS(handleMatch), [handleMatch]);
-  const reportErrorJs = useMemo(() => Worklets.createRunOnJS(reportError), [reportError]);
-
-  const { scanText } = useTextRecognition(TEXT_RECOGNITION_OPTIONS);
+  const recognizeAndMatchJs = useMemo(
+    () => Worklets.createRunOnJS(recognizeAndMatch),
+    [recognizeAndMatch],
+  );
 
   const frameProcessor = useFrameProcessor(
     (frame) => {
@@ -162,35 +144,27 @@ export function useImeiSerialReader(opts: UseImeiSerialReaderOptions): UseImeiSe
       runAtTargetFps(TARGET_FPS, () => {
         'worklet';
         if (isBusy.value) return;
+        if (isProcessing.value) return;
         if (Date.now() < graceUntil.value) return;
 
-        // Run scanText synchronously on the camera frame thread. The
-        // original code used `runAsync(frame, ...)` to push OCR onto a
-        // second worklet runtime, but under React Native's new architecture
-        // (bridgeless mode) that secondary runtime crashes with SIGSEGV in
-        // `JsiWorkletContext::invokeOnWorkletThread` on Android — confirmed
-        // tombstone with backtrace going through librnworklets.so →
-        // libVisionCamera.so → CameraView.onFrame. We're already throttled
-        // to TARGET_FPS via runAtTargetFps, so synchronous OCR is fine.
+        // Do only the fast, synchronous YUV→JPEG conversion on the camera
+        // frame thread (~20-50ms), then hand the path to the JS thread for
+        // OCR via PhotoRecognizer. This keeps the camera pipeline
+        // unblocked — preview stays smooth even though ML Kit runs off
+        // the frame thread. Also sidesteps the bridgeless SIGSEGV
+        // triggered by vision-camera's `runAsync` + worklets-core
+        // secondary runtime path.
         try {
-          const raw = scanText(frame);
-          const rt = toRecognizedText(raw);
-          const values = parser(rt);
-          if (values != null && values.length > 0) {
-            isBusy.value = true;
-            if (CAPTURE_MODE === 'native-frame' && captureFrameFlag.value) {
-              const ext = nativeFrameToJpeg(frame, JPEG_QUALITY);
-              handleMatchJs(values, ext.path, ext.width, ext.height, ext.orientation);
-            } else {
-              handleMatchJs(values, null, 0, 0, null);
-            }
-          }
+          isProcessing.value = true;
+          const ext = nativeFrameToJpeg(frame, JPEG_QUALITY);
+          recognizeAndMatchJs(ext.path, ext.width, ext.height, ext.orientation);
         } catch (e) {
+          isProcessing.value = false;
           reportErrorJs(e as Error);
         }
       });
     },
-    [parser, scanText, handleMatchJs, reportErrorJs, isBusy, graceUntil, captureFrameFlag],
+    [parser, recognizeAndMatchJs, reportErrorJs, isBusy, isProcessing, graceUntil],
   );
 
   const reload = useCallback(() => {
